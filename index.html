@@ -1,0 +1,1004 @@
+<!doctype html>
+<html>
+    <head>
+        <title>Convert .Schem to .Schematic</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <!-- https://github.com/kpanuragh/zlib -->
+        <script src="zlib.js"></script>
+        <!-- https://github.com/sjmulder/nbt-js -->
+        <script src="nbt.js"></script>
+        <script src="schemtoschematic.js"></script>
+        <script>
+            var STORAGE_KEY = "schemToSchematic_customMappings";
+            var BUNDLED_MAPPINGS_URL = "customMappings.json";
+            var _bundledMappings = {};
+
+            function getSavedMappings() {
+                var local = {};
+                try {
+                    local = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+                } catch (e) {}
+                // Merge: bundled as base, localStorage overrides
+                var merged = {};
+                for (var key in _bundledMappings) {
+                    merged[key] = _bundledMappings[key];
+                }
+                for (var key in local) {
+                    merged[key] = local[key];
+                }
+                return merged;
+            }
+
+            function saveMappings(mappings) {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(mappings));
+            }
+
+            function loadBundledMappings(cb) {
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", BUNDLED_MAPPINGS_URL, true);
+                xhr.onload = function () {
+                    if (xhr.status === 200) {
+                        try {
+                            _bundledMappings =
+                                JSON.parse(xhr.responseText) || {};
+                        } catch (e) {
+                            _bundledMappings = {};
+                        }
+                    }
+                    if (cb) cb();
+                };
+                xhr.onerror = function () {
+                    _bundledMappings = {};
+                    if (cb) cb();
+                };
+                xhr.send();
+            }
+
+            function exportMappings() {
+                var mappings = getSavedMappings();
+                var json = JSON.stringify(mappings, null, 2);
+                var blob = new Blob([json], { type: "application/json" });
+                var link = document.createElement("a");
+                link.href = window.URL.createObjectURL(blob);
+                link.download = "customMappings.json";
+                link.click();
+            }
+
+            function importMappings() {
+                var input = document.createElement("input");
+                input.type = "file";
+                input.accept = ".json";
+                input.onchange = function () {
+                    if (!input.files.length) return;
+                    var fr = new FileReader();
+                    fr.onload = function () {
+                        try {
+                            var imported = JSON.parse(fr.result);
+                            if (
+                                typeof imported !== "object" ||
+                                imported === null
+                            ) {
+                                alert(
+                                    "Invalid mappings file: expected a JSON object.",
+                                );
+                                return;
+                            }
+                            // Validate structure
+                            for (var key in imported) {
+                                var entry = imported[key];
+                                if (
+                                    typeof entry !== "object" ||
+                                    typeof entry.id !== "number"
+                                ) {
+                                    alert(
+                                        'Invalid entry for "' +
+                                            key +
+                                            '": each mapping needs { "id": number, "meta": number }',
+                                    );
+                                    return;
+                                }
+                                if (typeof entry.meta !== "number") {
+                                    entry.meta = 0;
+                                }
+                            }
+                            // Merge into localStorage
+                            var current = {};
+                            try {
+                                current =
+                                    JSON.parse(
+                                        localStorage.getItem(STORAGE_KEY),
+                                    ) || {};
+                            } catch (e) {}
+                            for (var key in imported) {
+                                current[key] = imported[key];
+                            }
+                            saveMappings(current);
+                            renderSavedMappings();
+                        } catch (e) {
+                            alert("Failed to parse JSON file: " + e.message);
+                        }
+                    };
+                    fr.readAsText(input.files[0]);
+                };
+                input.click();
+            }
+
+            function downloadSchematic(data, fileName) {
+                var name = fileName;
+                if (~name.lastIndexOf(".")) {
+                    name = name.substr(0, name.lastIndexOf("."));
+                }
+                name += ".schematic";
+
+                var blob = new Blob([data], { type: "application/nbt" });
+                var link = document.createElement("a");
+                link.href = window.URL.createObjectURL(blob);
+                link.download = name;
+                link.innerHTML = name;
+                link.click();
+                var li = document.createElement("li");
+                li.appendChild(link);
+                document.querySelector("#downloads").appendChild(li);
+            }
+
+            function convertAllFiles(fileBuffers, customMappings) {
+                for (var i = 0; i < fileBuffers.length; i++) {
+                    (function (fb) {
+                        console.log("Converting " + fb.name);
+                        schemtoschematic(
+                            fb.buffer,
+                            function (data) {
+                                downloadSchematic(data, fb.name);
+                            },
+                            customMappings,
+                        );
+                    })(fileBuffers[i]);
+                }
+            }
+
+            function handleDrop(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                document
+                    .querySelector(".drop-zone")
+                    .classList.remove("drag-over");
+                var files = e.dataTransfer.files;
+                if (files.length > 0) processFiles(files);
+            }
+
+            function handleDragOver(e) {
+                e.preventDefault();
+                document.querySelector(".drop-zone").classList.add("drag-over");
+            }
+
+            function handleDragLeave(e) {
+                e.preventDefault();
+                document
+                    .querySelector(".drop-zone")
+                    .classList.remove("drag-over");
+            }
+
+            function upload(input) {
+                processFiles(input.files);
+            }
+
+            function processFiles(files) {
+                if (files.length === 0) return;
+
+                document.querySelector("#error").innerHTML = "";
+                document.querySelector("#downloads").innerHTML = "";
+                document.querySelector("#mapping-form").style.display = "none";
+
+                var fileBuffers = [];
+                var allUnknowns = [];
+                var filesRead = 0;
+                var totalFiles = files.length;
+
+                for (var i = 0; i < totalFiles; i++) {
+                    (function (file) {
+                        var fr = new FileReader();
+                        fr.onload = function () {
+                            fileBuffers.push({
+                                name: file.name,
+                                buffer: fr.result,
+                            });
+
+                            findUnknownBlocks(fr.result, function (unknowns) {
+                                for (var j = 0; j < unknowns.length; j++) {
+                                    if (
+                                        allUnknowns.indexOf(unknowns[j]) === -1
+                                    ) {
+                                        allUnknowns.push(unknowns[j]);
+                                    }
+                                }
+
+                                filesRead++;
+                                if (filesRead === totalFiles) {
+                                    onAllFilesScanned(fileBuffers, allUnknowns);
+                                }
+                            });
+                        };
+                        fr.readAsArrayBuffer(file);
+                    })(files[i]);
+                }
+            }
+
+            function onAllFilesScanned(fileBuffers, allUnknowns) {
+                var saved = getSavedMappings();
+
+                var needsMapping = [];
+                for (var i = 0; i < allUnknowns.length; i++) {
+                    if (!(allUnknowns[i] in saved)) {
+                        needsMapping.push(allUnknowns[i]);
+                    }
+                }
+
+                if (needsMapping.length === 0) {
+                    convertAllFiles(fileBuffers, saved);
+                    return;
+                }
+
+                showMappingForm(needsMapping, fileBuffers, saved);
+            }
+
+            function showMappingForm(unknowns, fileBuffers, savedMappings) {
+                var container = document.querySelector("#mapping-form");
+                container.style.display = "block";
+
+                unknowns.sort();
+
+                var html = '<div class="card warning-card">';
+                html += "<h2>Unknown Blocks Found</h2>";
+                html +=
+                    "<p>These blocks have no built-in mapping. Enter the legacy block ID and metadata for each:</p>";
+                html += '<div class="table-wrap"><table>';
+                html +=
+                    "<thead><tr><th>Block Name</th><th>Block ID</th><th>Meta</th></tr></thead><tbody>";
+
+                for (var i = 0; i < unknowns.length; i++) {
+                    html += "<tr>";
+                    html += "<td><code>" + unknowns[i] + "</code></td>";
+                    html +=
+                        '<td><input type="number" class="mapping-id" data-block="' +
+                        unknowns[i] +
+                        '" min="0" max="4095" placeholder="0-4095"></td>';
+                    html +=
+                        '<td><input type="number" class="mapping-meta" data-block="' +
+                        unknowns[i] +
+                        '" min="0" max="15" value="0" placeholder="0-15"></td>';
+                    html += "</tr>";
+                }
+
+                html += "</tbody></table></div>";
+                html +=
+                    '<button class="btn btn-primary" id="convert-btn" onclick="onConvertClick()">Convert Files</button>';
+                html += "</div>";
+                container.innerHTML = html;
+
+                container._fileBuffers = fileBuffers;
+                container._savedMappings = savedMappings;
+                container._unknowns = unknowns;
+
+                container.scrollIntoView({ behavior: "smooth" });
+            }
+
+            function onConvertClick() {
+                var container = document.querySelector("#mapping-form");
+                var fileBuffers = container._fileBuffers;
+                var savedMappings = container._savedMappings;
+
+                var idInputs = document.querySelectorAll(".mapping-id");
+                var metaInputs = document.querySelectorAll(".mapping-meta");
+                var newMappings = {};
+                var valid = true;
+
+                for (var i = 0; i < idInputs.length; i++) {
+                    var blockName = idInputs[i].getAttribute("data-block");
+                    var idVal = idInputs[i].value.trim();
+                    var metaVal = metaInputs[i].value.trim();
+
+                    if (idVal === "" || isNaN(parseInt(idVal))) {
+                        idInputs[i].classList.add("input-error");
+                        valid = false;
+                        continue;
+                    }
+
+                    idInputs[i].classList.remove("input-error");
+                    newMappings[blockName] = {
+                        id: parseInt(idVal),
+                        meta: metaVal === "" ? 0 : parseInt(metaVal),
+                    };
+                }
+
+                if (!valid) {
+                    return;
+                }
+
+                var combined = {};
+                for (var key in savedMappings) {
+                    combined[key] = savedMappings[key];
+                }
+                for (var key in newMappings) {
+                    combined[key] = newMappings[key];
+                }
+
+                saveMappings(combined);
+                container.style.display = "none";
+                convertAllFiles(fileBuffers, combined);
+                renderSavedMappings();
+            }
+
+            function clearSavedMappings() {
+                if (!confirm("Clear all saved block mappings?")) return;
+                localStorage.removeItem(STORAGE_KEY);
+                renderSavedMappings();
+            }
+
+            function deleteSavedMapping(blockName) {
+                var saved = getSavedMappings();
+                delete saved[blockName];
+                saveMappings(saved);
+                renderSavedMappings();
+            }
+
+            function renderSavedMappings() {
+                var saved = getSavedMappings();
+                var local = {};
+                try {
+                    local = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+                } catch (e) {}
+                var container = document.querySelector("#saved-mappings");
+                var keys = Object.keys(saved);
+
+                if (keys.length === 0) {
+                    container.innerHTML =
+                        '<p class="empty-state">No custom mappings yet. Unknown blocks will be detected when you upload a file, or import a mappings JSON.</p>';
+                    return;
+                }
+
+                keys.sort();
+                var html = '<div class="table-wrap"><table>';
+                html +=
+                    "<thead><tr><th>Block Name</th><th>ID</th><th>Meta</th><th>Source</th><th></th></tr></thead><tbody>";
+
+                for (var i = 0; i < keys.length; i++) {
+                    var key = keys[i];
+                    var isBundled = key in _bundledMappings;
+                    var isLocal = key in local;
+                    var source = isLocal ? "local" : "bundled";
+                    html += "<tr>";
+                    html += "<td><code>" + key + "</code></td>";
+                    html += '<td class="num-cell">' + saved[key].id + "</td>";
+                    html += '<td class="num-cell">' + saved[key].meta + "</td>";
+                    html +=
+                        '<td><span class="badge badge-' +
+                        source +
+                        '">' +
+                        source +
+                        "</span></td>";
+                    if (isLocal) {
+                        html +=
+                            '<td><button class="btn btn-sm btn-danger" onclick="deleteSavedMapping(\'' +
+                            key.replace(/'/g, "\\'") +
+                            '\')" title="Remove mapping">&times;</button></td>';
+                    } else {
+                        html += "<td></td>";
+                    }
+                    html += "</tr>";
+                }
+
+                html += "</tbody></table></div>";
+                container.innerHTML = html;
+            }
+
+            window.addEventListener("DOMContentLoaded", function () {
+                loadBundledMappings(function () {
+                    renderSavedMappings();
+                });
+            });
+        </script>
+
+        <style>
+            :root {
+                --bg: #0f1117;
+                --surface: #1a1d27;
+                --surface-2: #22262f;
+                --surface-3: #2a2e3a;
+                --border: #333845;
+                --border-light: #3d4255;
+                --text: #e1e4ed;
+                --text-dim: #8b90a0;
+                --text-muted: #5c6070;
+                --accent: #7c6bf5;
+                --accent-hover: #6b5ae0;
+                --accent-glow: rgba(124, 107, 245, 0.15);
+                --danger: #e55565;
+                --danger-hover: #d44050;
+                --warning: #e8a33d;
+                --warning-bg: rgba(232, 163, 61, 0.08);
+                --warning-border: rgba(232, 163, 61, 0.25);
+                --success: #4ade80;
+                --link: #7c9bf5;
+                --radius: 10px;
+                --radius-sm: 6px;
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            html {
+                height: 100%;
+            }
+
+            body {
+                background: var(--bg);
+                color: var(--text);
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Oxygen, Ubuntu, sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+                min-height: 100%;
+                -webkit-font-smoothing: antialiased;
+            }
+
+            .container {
+                max-width: 680px;
+                margin: 0 auto;
+                padding: 40px 24px 60px;
+            }
+
+            .header {
+                margin-bottom: 32px;
+            }
+
+            .header h1 {
+                font-size: 24px;
+                font-weight: 700;
+                letter-spacing: -0.5px;
+                margin-bottom: 8px;
+            }
+
+            .header h1 .accent {
+                color: var(--accent);
+            }
+
+            .header p {
+                color: var(--text-dim);
+                font-size: 14px;
+            }
+
+            .header .subtitle {
+                color: var(--accent);
+                font-size: 13px;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.8px;
+                margin-bottom: 12px;
+            }
+
+            .gtnh-notice {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-left: 3px solid var(--accent);
+                border-radius: var(--radius-sm);
+                padding: 14px 16px;
+                margin-top: 4px;
+            }
+
+            .gtnh-notice p {
+                color: var(--text-dim);
+                font-size: 13px;
+                line-height: 1.6;
+                margin: 0 0 8px 0;
+            }
+
+            .gtnh-notice p:last-child {
+                margin-bottom: 0;
+            }
+
+            kbd {
+                background: var(--surface-3);
+                border: 1px solid var(--border-light);
+                border-radius: 3px;
+                padding: 1px 5px;
+                font-family: inherit;
+                font-size: 12px;
+                color: var(--text);
+            }
+
+            .gtnh-notice strong {
+                color: var(--text);
+            }
+
+            .gtnh-notice code {
+                font-size: 12px;
+            }
+
+            .card {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 24px;
+                margin-bottom: 20px;
+            }
+
+            .card h2 {
+                font-size: 15px;
+                font-weight: 600;
+                margin-bottom: 4px;
+            }
+
+            .card h3 {
+                font-size: 14px;
+                font-weight: 600;
+                margin-bottom: 12px;
+                color: var(--text-dim);
+            }
+
+            .card > p {
+                color: var(--text-dim);
+                font-size: 13px;
+                margin-bottom: 16px;
+            }
+
+            .warning-card {
+                background: var(--warning-bg);
+                border-color: var(--warning-border);
+            }
+
+            .warning-card h2 {
+                color: var(--warning);
+            }
+
+            /* Drop zone */
+            .drop-zone {
+                border: 2px dashed var(--border-light);
+                border-radius: var(--radius);
+                padding: 40px 24px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                background: var(--surface);
+                position: relative;
+            }
+
+            .drop-zone:hover,
+            .drop-zone.drag-over {
+                border-color: var(--accent);
+                background: var(--accent-glow);
+            }
+
+            .drop-zone-icon {
+                font-size: 36px;
+                margin-bottom: 12px;
+                display: block;
+                opacity: 0.5;
+            }
+
+            .drop-zone-text {
+                color: var(--text-dim);
+                font-size: 14px;
+            }
+
+            .drop-zone-text strong {
+                color: var(--accent);
+            }
+
+            .drop-zone input[type="file"] {
+                position: absolute;
+                inset: 0;
+                opacity: 0;
+                cursor: pointer;
+            }
+
+            .privacy-note {
+                display: block;
+                color: var(--text-muted);
+                font-size: 12px;
+                margin-top: 12px;
+                text-align: center;
+            }
+
+            /* Downloads */
+            #downloads {
+                list-style: none;
+                margin-top: 16px;
+            }
+
+            #downloads:empty {
+                margin: 0;
+            }
+
+            #downloads li {
+                background: var(--surface-2);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-sm);
+                padding: 10px 14px;
+                margin-bottom: 8px;
+                display: flex;
+                align-items: center;
+            }
+
+            #downloads li::before {
+                content: "\2193";
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 24px;
+                height: 24px;
+                border-radius: 50%;
+                background: rgba(74, 222, 128, 0.12);
+                color: var(--success);
+                font-size: 14px;
+                font-weight: 700;
+                margin-right: 10px;
+                flex-shrink: 0;
+            }
+
+            #downloads a {
+                color: var(--link);
+                text-decoration: none;
+                font-size: 13px;
+                font-weight: 500;
+            }
+
+            #downloads a:hover {
+                text-decoration: underline;
+            }
+
+            #error {
+                color: var(--danger);
+                font-size: 13px;
+            }
+
+            #error:empty {
+                display: none;
+            }
+
+            /* Tables */
+            .table-wrap {
+                overflow-x: auto;
+                margin: 12px 0;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+
+            thead th {
+                background: var(--surface-3);
+                color: var(--text-dim);
+                font-size: 11px;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                padding: 8px 12px;
+                text-align: left;
+                border-bottom: 1px solid var(--border);
+            }
+
+            thead th:first-child {
+                border-radius: var(--radius-sm) 0 0 0;
+            }
+
+            thead th:last-child {
+                border-radius: 0 var(--radius-sm) 0 0;
+            }
+
+            tbody td {
+                padding: 10px 12px;
+                border-bottom: 1px solid var(--border);
+                font-size: 13px;
+                vertical-align: middle;
+            }
+
+            tbody tr:last-child td {
+                border-bottom: none;
+            }
+
+            tbody tr:hover {
+                background: rgba(255, 255, 255, 0.02);
+            }
+
+            .num-cell {
+                font-variant-numeric: tabular-nums;
+                color: var(--text-dim);
+                text-align: center;
+                width: 60px;
+            }
+
+            code {
+                background: var(--surface-3);
+                color: var(--accent);
+                padding: 2px 7px;
+                border-radius: 4px;
+                font-family:
+                    "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+                font-size: 12px;
+            }
+
+            /* Inputs */
+            input[type="number"] {
+                background: var(--surface-2);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-sm);
+                color: var(--text);
+                padding: 7px 10px;
+                width: 90px;
+                font-size: 13px;
+                transition: border-color 0.15s;
+                font-family: inherit;
+            }
+
+            input[type="number"]:focus {
+                outline: none;
+                border-color: var(--accent);
+                box-shadow: 0 0 0 3px var(--accent-glow);
+            }
+
+            input[type="number"].input-error {
+                border-color: var(--danger);
+                box-shadow: 0 0 0 3px rgba(229, 85, 101, 0.15);
+            }
+
+            input[type="number"]::-webkit-inner-spin-button {
+                opacity: 0.3;
+            }
+
+            /* Buttons */
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                border: none;
+                border-radius: var(--radius-sm);
+                font-family: inherit;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 9px 20px;
+                cursor: pointer;
+                transition: all 0.15s ease;
+            }
+
+            .btn-primary {
+                background: var(--accent);
+                color: #fff;
+            }
+
+            .btn-primary:hover {
+                background: var(--accent-hover);
+                box-shadow: 0 4px 12px rgba(124, 107, 245, 0.3);
+            }
+
+            .btn-ghost {
+                background: transparent;
+                color: var(--text-dim);
+                border: 1px solid var(--border);
+            }
+
+            .btn-ghost:hover {
+                background: var(--surface-2);
+                color: var(--text);
+                border-color: var(--border-light);
+            }
+
+            .btn-danger {
+                background: transparent;
+                color: var(--danger);
+                border: 1px solid transparent;
+            }
+
+            .btn-danger:hover {
+                background: rgba(229, 85, 101, 0.1);
+            }
+
+            .btn-sm {
+                padding: 4px 10px;
+                font-size: 16px;
+                line-height: 1;
+                border-radius: 4px;
+            }
+
+            .btn-row {
+                display: flex;
+                gap: 8px;
+                margin-top: 12px;
+            }
+
+            /* Mapping form */
+            #mapping-form {
+                margin-top: 20px;
+            }
+
+            /* Saved mappings */
+            .saved-section {
+                margin-top: 32px;
+            }
+
+            .saved-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                margin-bottom: 12px;
+            }
+
+            .saved-header h3 {
+                margin: 0;
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--text-dim);
+            }
+
+            .saved-actions {
+                display: flex;
+                gap: 6px;
+            }
+
+            .btn-danger-text {
+                color: var(--danger);
+            }
+
+            .btn-danger-text:hover {
+                background: rgba(229, 85, 101, 0.1);
+                color: var(--danger);
+                border-color: var(--danger);
+            }
+
+            .empty-state {
+                color: var(--text-muted);
+                font-size: 13px;
+                font-style: italic;
+                padding: 20px 0;
+                text-align: center;
+            }
+
+            .badge {
+                display: inline-block;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 2px 8px;
+                border-radius: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.3px;
+            }
+
+            .badge-local {
+                background: rgba(124, 107, 245, 0.15);
+                color: var(--accent);
+            }
+
+            .badge-bundled {
+                background: rgba(74, 222, 128, 0.12);
+                color: var(--success);
+            }
+
+            .footer {
+                margin-top: 40px;
+                padding-top: 20px;
+                border-top: 1px solid var(--border);
+                text-align: center;
+            }
+
+            .footer p {
+                color: var(--text-muted);
+                font-size: 12px;
+            }
+
+            .footer a {
+                color: var(--link);
+                text-decoration: none;
+            }
+
+            .footer a:hover {
+                text-decoration: underline;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>
+                    <span class="accent">.schem</span> to
+                    <span class="accent">.schematic</span>
+                </h1>
+                <p class="subtitle">
+                    GTNH Fork &mdash; Extended Block ID Support
+                </p>
+                <div class="gtnh-notice">
+                    <p>
+                        This tool converts WorldEdit 1.13+
+                        <code>.schem</code> files to legacy
+                        <code>.schematic</code> files for use with
+                        <strong>GregTech: New Horizons</strong> and its extended
+                        ID system.
+                    </p>
+                    <p>
+                        You will be prompted to enter the block ID and metadata
+                        for any unmapped blocks. Toggle advanced tooltips
+                        <kbd>F3+H</kbd> in your GTNH instance to see block IDs
+                        and metadata.
+                    </p>
+                    <p>
+                        IDs may shift when different add-ons are installed, so
+                        double-check that imported mappings are still correct.
+                    </p>
+                </div>
+            </div>
+
+            <div
+                class="drop-zone"
+                ondrop="handleDrop(event)"
+                ondragover="handleDragOver(event)"
+                ondragleave="handleDragLeave(event)"
+            >
+                <span class="drop-zone-icon">&#128451;</span>
+                <div class="drop-zone-text">
+                    Drag &amp; drop <strong>.schem</strong> files here, or click
+                    to browse
+                </div>
+                <input
+                    id="file"
+                    type="file"
+                    onchange="upload(this)"
+                    multiple
+                    accept=".schem"
+                />
+            </div>
+            <small class="privacy-note"
+                >All files are processed locally &mdash; nothing is uploaded to
+                any server</small
+            >
+
+            <ul id="downloads"></ul>
+            <p id="error"></p>
+
+            <div id="mapping-form" style="display: none"></div>
+
+            <div class="saved-section">
+                <div class="card">
+                    <div class="saved-header">
+                        <h3>Saved Mappings</h3>
+                        <div class="saved-actions">
+                            <button
+                                class="btn btn-ghost"
+                                onclick="importMappings()"
+                                title="Import mappings from a JSON file"
+                            >
+                                Import
+                            </button>
+                            <button
+                                class="btn btn-ghost"
+                                onclick="exportMappings()"
+                                title="Export mappings to a JSON file"
+                            >
+                                Export
+                            </button>
+                            <button
+                                class="btn btn-ghost btn-danger-text"
+                                onclick="clearSavedMappings()"
+                            >
+                                Clear All
+                            </button>
+                        </div>
+                    </div>
+                    <div id="saved-mappings"></div>
+                </div>
+            </div>
+
+            <footer class="footer">
+                <p>
+                    Forked from
+                    <a href="https://github.com/PureGero/SchemToSchematic">
+                        SchemToSchematic
+                    </a>
+                    by PureGero
+                </p>
+            </footer>
+        </div>
+    </body>
+</html>
