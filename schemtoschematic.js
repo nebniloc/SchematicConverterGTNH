@@ -1605,7 +1605,7 @@ var blocksNamespace = {
 'minecraft:structure_block[mode=data]':4083
 };
 
-function findUnknownBlocks(arrayBuffer, callback) {
+function findUnknownBlocks(arrayBuffer, callback, customMappings) {
     nbt.parse(arrayBuffer, function(error, root) {
         if (error) { throw error; }
 
@@ -1617,7 +1617,7 @@ function findUnknownBlocks(arrayBuffer, callback) {
 
         if ('Palette' in root.value) {
             for (var key in root.value.Palette.value) {
-                if (!(key in blocksNamespace) && _testConvertToLegacyBlockId(key) === 0 && key !== 'minecraft:air') {
+                if (!(key in blocksNamespace) && _testConvertToLegacyBlockId(key, customMappings) === 0 && key !== 'minecraft:air') {
                     var baseName = key.indexOf('[') !== -1 ? key.substr(0, key.indexOf('[')) : key;
                     if (unknowns.indexOf(baseName) === -1) {
                         unknowns.push(baseName);
@@ -1631,7 +1631,7 @@ function findUnknownBlocks(arrayBuffer, callback) {
 }
 
 // Test-only version of convertToLegacyBlockId that doesn't modify the DOM
-function _testConvertToLegacyBlockId(namespaceKey) {
+function _testConvertToLegacyBlockId(namespaceKey, customMappings) {
     if (namespaceKey in blocksNamespace) {
         return blocksNamespace[namespaceKey];
     }
@@ -1796,6 +1796,13 @@ function _testConvertToLegacyBlockId(namespaceKey) {
         if (tempkey in blocksNamespace) { return blocksNamespace[tempkey]; }
     }
 
+    // Check custom mappings by full key first, then base name
+    if (customMappings) {
+        if (originalKey in customMappings) return customMappings[originalKey].id << 4 | customMappings[originalKey].meta;
+        var baseName = originalKey.indexOf('[') !== -1 ? originalKey.substr(0, originalKey.indexOf('[')) : originalKey;
+        if (baseName in customMappings) return customMappings[baseName].id << 4 | customMappings[baseName].meta;
+    }
+
     return 0;
 }
 
@@ -1897,7 +1904,32 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
         if (namespaceKey in blocksNamespace) {
             return blocksNamespace[namespaceKey];
         }
-        
+
+        // Check custom mappings early, same as blocksNamespace — before normalizations run
+        if (customMappings) {
+            var baseName = namespaceKey.indexOf('[') !== -1 ? namespaceKey.substr(0, namespaceKey.indexOf('[')) : namespaceKey;
+            if (baseName in customMappings) {
+                var mapping = customMappings[baseName];
+                var meta = mapping.meta;
+                // Auto-detect rotation from block state properties
+                var facingMatch = namespaceKey.match(/facing=(\w+)/);
+                if (facingMatch) {
+                    var facingMeta = {down:0, up:1, north:2, south:3, west:4, east:5};
+                    if (facingMatch[1] in facingMeta) {
+                        meta = facingMeta[facingMatch[1]];
+                    }
+                }
+                var axisMatch = namespaceKey.match(/axis=(\w+)/);
+                if (axisMatch) {
+                    var axisMeta = {y:0, x:4, z:8};
+                    if (axisMatch[1] in axisMeta) {
+                        meta = (meta & 0x3) | axisMeta[axisMatch[1]];
+                    }
+                }
+                return (mapping.id << 4) | (meta & 0xF);
+            }
+        }
+
         // Not in the table, try to find a match
         var originalKey = namespaceKey;
         var index;
@@ -2089,15 +2121,6 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
             }
         }
         
-        // Check custom mappings before falling through to air
-        if (customMappings) {
-            var baseName = originalKey.indexOf('[') !== -1 ? originalKey.substr(0, originalKey.indexOf('[')) : originalKey;
-            if (baseName in customMappings) {
-                var mapping = customMappings[baseName];
-                return (mapping.id << 4) | (mapping.meta & 0xF);
-            }
-        }
-
         var error = 'Unknown namespace key: ' + originalKey + ', replacing with air.';
 
         if (document && document.querySelector) {

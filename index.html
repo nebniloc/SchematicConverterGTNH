@@ -216,7 +216,7 @@
                                 if (filesRead === totalFiles) {
                                     onAllFilesScanned(fileBuffers, allUnknowns);
                                 }
-                            });
+                            }, getSavedMappings());
                         };
                         fr.readAsArrayBuffer(file);
                     })(files[i]);
