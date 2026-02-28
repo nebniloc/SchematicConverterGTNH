@@ -9,15 +9,8 @@ if (typeof zlib === "undefined") {
 var blocksNamespace = {
   "minecraft:air": 0,
   "minecraft:stone": 16,
-  "minecraft:granite": 17,
-  "minecraft:polished_granite": 18,
-  "minecraft:diorite": 19,
-  "minecraft:polished_diorite": 20,
-  "minecraft:andesite": 21,
-  "minecraft:polished_andesite": 22,
   "minecraft:grass_block[snowy=false]": 32,
   "minecraft:dirt": 48,
-  "minecraft:coarse_dirt": 49,
   "minecraft:podzol[snowy=false]": 50,
   "minecraft:cobblestone": 64,
   "minecraft:oak_planks": 80,
@@ -1495,6 +1488,34 @@ function _testConvertToLegacyBlockId(namespaceKey, customMappings) {
 }
 
 function schemtoschematic(arrayBuffer, callback, customMappings) {
+  function shouldResetLegacyMetadata(namespaceKey) {
+    var baseName =
+      namespaceKey.indexOf("[") !== -1
+        ? namespaceKey.substr(0, namespaceKey.indexOf("["))
+        : namespaceKey;
+
+    // If user provided an explicit custom mapping, keep its metadata.
+    if (
+      customMappings &&
+      (namespaceKey in customMappings || baseName in customMappings)
+    ) {
+      return false;
+    }
+
+    // Connectivity blocks can expose debug-only states that have no clean
+    // 1.7.10 metadata equivalent; force meta 0 to avoid bad remaps.
+    if (
+      /_wall$/.test(baseName) ||
+      /_fence$/.test(baseName) ||
+      baseName === "minecraft:iron_bars" ||
+      baseName === "minecraft:glass_pane"
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
   // Move the width/length/height data to the old location
   function moveSize(root) {
     if ("Schematic" in root.value && "Width" in root.value.Schematic.value) {
@@ -1586,6 +1607,27 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
     root.value.Materials = { type: "string", value: "Alpha" };
   }
 
+  // Remove Sponge .schem-only tags so WorldEdit reads this as classic .schematic.
+  function cleanupLegacySchematic(root) {
+    delete root.value.Palette;
+    delete root.value.PaletteMax;
+    delete root.value.Version;
+    delete root.value.DataVersion;
+    delete root.value.Metadata;
+    delete root.value.BlockData;
+    delete root.value.BlockEntities;
+
+    if (!("Entities" in root.value)) {
+      root.value.Entities = { type: "list", value: { type: "end", value: [] } };
+    }
+    if (!("TileEntities" in root.value)) {
+      root.value.TileEntities = {
+        type: "list",
+        value: { type: "end", value: [] },
+      };
+    }
+  }
+
   // Move the tile entites to the old location and modify their position and id data
   function moveTileEntities(root) {
     if (
@@ -1636,38 +1678,21 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
       return blocksNamespace[namespaceKey];
     }
 
-    // Check custom mappings early, same as blocksNamespace — before normalizations run
+    // Check custom mappings early, same as blocksNamespace — before normalizations run.
+    // Custom mapping metadata should be respected exactly as provided.
     if (customMappings) {
+      if (namespaceKey in customMappings) {
+        var fullKeyMapping = customMappings[namespaceKey];
+        return (fullKeyMapping.id << 4) | (fullKeyMapping.meta & 0xf);
+      }
+
       var baseName =
         namespaceKey.indexOf("[") !== -1
           ? namespaceKey.substr(0, namespaceKey.indexOf("["))
           : namespaceKey;
       if (baseName in customMappings) {
         var mapping = customMappings[baseName];
-        var meta = mapping.meta;
-        // Auto-detect rotation from block state properties
-        var facingMatch = namespaceKey.match(/facing=(\w+)/);
-        if (facingMatch) {
-          var facingMeta = {
-            down: 0,
-            up: 1,
-            north: 2,
-            south: 3,
-            west: 4,
-            east: 5,
-          };
-          if (facingMatch[1] in facingMeta) {
-            meta = facingMeta[facingMatch[1]];
-          }
-        }
-        var axisMatch = namespaceKey.match(/axis=(\w+)/);
-        if (axisMatch) {
-          var axisMeta = { y: 0, x: 4, z: 8 };
-          if (axisMatch[1] in axisMeta) {
-            meta = (meta & 0x3) | axisMeta[axisMatch[1]];
-          }
-        }
-        return (mapping.id << 4) | (meta & 0xf);
+        return (mapping.id << 4) | (mapping.meta & 0xf);
       }
     }
 
@@ -2028,7 +2053,12 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
           continue;
         }
 
-        blockId = convertToLegacyBlockId(palette[varInt]);
+        var paletteKey = palette[varInt];
+        blockId = convertToLegacyBlockId(paletteKey);
+
+        if (shouldResetLegacyMetadata(paletteKey)) {
+          blockId &= ~0xf;
+        }
 
         fullBlockId = blockId >> 4;
         metadata = blockId & 0xf;
@@ -2052,9 +2082,11 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
       if (addBlocksNeeded) {
         var packedAddBlocks = [];
         for (var j = 0; j < addBlocks.length; j += 2) {
-          var high = addBlocks[j] & 0xf;
-          var low = j + 1 < addBlocks.length ? addBlocks[j + 1] & 0xf : 0;
-          packedAddBlocks.push((high << 4) | low);
+          // Schematic AddBlocks stores the first entry in the low nibble and
+          // the second entry in the high nibble.
+          var low = addBlocks[j] & 0xf;
+          var high = j + 1 < addBlocks.length ? addBlocks[j + 1] & 0xf : 0;
+          packedAddBlocks.push(low | (high << 4));
         }
         root.value.AddBlocks = { type: "byteArray", value: packedAddBlocks };
       }
@@ -2078,6 +2110,7 @@ function schemtoschematic(arrayBuffer, callback, customMappings) {
     setMaterials(root);
     moveTileEntities(root);
     convertBlockData(root);
+    cleanupLegacySchematic(root);
 
     zlib.gzip(
       new Uint8Array(nbt.writeUncompressed(root)),
